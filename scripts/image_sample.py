@@ -2,6 +2,7 @@
 Generate a large batch of image samples from a model and save them as a large
 numpy array. This can be used to produce samples for FID evaluation.
 """
+from PIL import Image
 
 import argparse
 import os
@@ -9,8 +10,10 @@ import os
 import numpy as np
 import torch as th
 import torch.distributed as dist
-import matplotlib.pyplot as plt
+#import matplotlib.pyplot as plt
 
+import sys
+sys.path.append(".")
 from patch_diffusion import dist_util, logger
 from patch_diffusion.script_util import (
     NUM_CLASSES,
@@ -20,26 +23,34 @@ from patch_diffusion.script_util import (
     args_to_dict,
 )
 
-def save_images(images, figure_path, figdims='4,4', scale='5'):
-    figdims = [int(d) for d in figdims.split(',')]
-    scale = float(scale)
+#def save_images(images, figure_path, figdims='4,4', scale='5'):
+#    figdims = [int(d) for d in figdims.split(',')]
+#    scale = float(scale)
+#
+#    if figdims is None:
+#        m = len(images)//10 + 1
+#        n = 10
+#    else:
+#        m, n = figdims
+#
+#    plt.figure(figsize=(scale*n, scale*m))
+#
+#    for i in range(len(images[:m*n])):
+#        plt.subplot(m, n, i+1)
+#        plt.imshow(images[i])
+#        plt.axis('off')
+#
+#    plt.tight_layout()
+#    plt.savefig(figure_path)
+#    print(f"saved image samples at {figure_path}")
 
-    if figdims is None:
-        m = len(images)//10 + 1
-        n = 10
-    else:
-        m, n = figdims
-
-    plt.figure(figsize=(scale*n, scale*m))
-
-    for i in range(len(images[:m*n])):
-        plt.subplot(m, n, i+1)
-        plt.imshow(images[i])
-        plt.axis('off')
-
-    plt.tight_layout()
-    plt.savefig(figure_path)
-    print(f"saved image samples at {figure_path}")
+def save_output(out_path, arr0, label_arr=None, save_npz=True):
+    Image.fromarray(arr0).save(out_path+".png")
+    if save_npz:
+        if label_arr is not None:
+            np.savez(out_path+".npz", arr0[None,...], label_arr[None,...])
+        else:
+            np.savez(out_path+".npz", arr0[None,...])
 
 def main():
     args = create_argparser().parse_args()
@@ -83,9 +94,10 @@ def main():
         denoised_fn = None
 
     logger.log("sampling...")
+    N_sample = 0
     all_images = []
     all_labels = []
-    while len(all_images) * args.batch_size < args.num_samples:
+    while N_sample < args.num_samples:
         model_kwargs = {}
         if args.class_cond:
             classes = th.randint(
@@ -106,46 +118,17 @@ def main():
         sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
         sample = sample.permute(0, 2, 3, 1)
         sample = sample.contiguous()
+        sample = sample.cpu().numpy()
 
-        gathered_samples = [th.zeros_like(sample) for _ in range(dist.get_world_size())]
-        dist.all_gather(gathered_samples, sample)  # gather not supported with NCCL
-        all_images.extend([sample.cpu().numpy() for sample in gathered_samples])
-        if args.class_cond:
-            gathered_labels = [
-                th.zeros_like(classes) for _ in range(dist.get_world_size())
-            ]
-            dist.all_gather(gathered_labels, classes)
-            all_labels.extend([labels.cpu().numpy() for labels in gathered_labels])
-        logger.log(f"created {len(all_images) * args.batch_size} samples")
-
-    arr = np.concatenate(all_images, axis=0)
-    arr = arr[: args.num_samples]
-    if args.class_cond:
-        label_arr = np.concatenate(all_labels, axis=0)
-        label_arr = label_arr[: args.num_samples]
-    if dist.get_rank() == 0:
-        shape_str = "x".join([str(x) for x in arr.shape])
-
-        samples_index = len(os.listdir(args.save_dir))//2
-
-        out_path = os.path.join(args.save_dir, f"samples_{shape_str}_{samples_index}.npz")
-        if os.path.exists(out_path):
-            print(f"Warning, there is already an npz file {out_path}, saving to a different file...")
-            new_rands = np.random.randint(0, high=1e6)
-            samples_index += new_rands
-            out_path = os.path.join(args.save_dir, f"samples_{shape_str}_{samples_index}.npz")
-        
+        out_path = args.save_dir
         logger.log(f"saving to {out_path}")
-        if args.class_cond:
-            np.savez(out_path, arr, label_arr)
-        else:
-            np.savez(out_path, arr)
+        for i in range(len(sample)):
+            fname = str(N_sample+i).zfill(5)
+            out_path_i = os.path.join(out_path, fname)
+            save_output(out_path_i, sample[i])
+            logger.log(f"saving to {out_path_i}")
+        N_sample += sample.shape[0]
 
-        out_path = os.path.join(args.save_dir, f"samples_{shape_str}_{samples_index}.png")
-        if os.path.exists(out_path):
-            print(f"Warning, there is already a png file {out_path}, overwriting this file...")
-
-        save_images(arr, out_path, args.figdims, args.figscale)
 
     dist.barrier()
     logger.log("sampling complete")
